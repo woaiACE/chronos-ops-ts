@@ -1,0 +1,5 @@
+gluonts[torch]
+chronos-forecasting
+pandas
+matplotlib
+scikit-learn
