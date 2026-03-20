@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import torch
 from chronos import BaseChronosPipeline, Chronos2Pipeline
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
+from sklearn.linear_model import Lasso, Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Forecast call volume and tickets received using Chronos via GluonTS.")
@@ -167,6 +170,256 @@ def predict_quantiles(pipeline, context_values, prediction_length, device, quant
         quantile_np = quantile_forecast.cpu().numpy()[0]
 
     return [quantile_np[:, index] for index, _ in enumerate(quantiles)]
+
+
+def build_supervised_features(df, target_col, reference_col=None):
+    features = pd.DataFrame(index=df.index)
+
+    date_series = pd.to_datetime(df['date'])
+    day_of_week = date_series.dt.dayofweek
+    day_of_year = date_series.dt.dayofyear
+
+    # Temporal features
+    features['day_of_week'] = day_of_week
+    features['is_weekend'] = (day_of_week >= 5).astype(int)
+    features['day_of_month'] = date_series.dt.day
+    features['month'] = date_series.dt.month
+    features['week_of_year'] = date_series.dt.isocalendar().week.astype(int)
+    features['dow_sin'] = np.sin(2 * np.pi * day_of_week / 7)
+    features['dow_cos'] = np.cos(2 * np.pi * day_of_week / 7)
+    features['doy_sin'] = np.sin(2 * np.pi * day_of_year / 365.25)
+    features['doy_cos'] = np.cos(2 * np.pi * day_of_year / 365.25)
+
+    target = df[target_col].astype(float)
+
+    # Lag features
+    for lag in range(1, 15):
+        features[f'{target_col}_lag_{lag}'] = target.shift(lag)
+
+    # Rolling features
+    for window in [3, 7, 14, 30]:
+        features[f'{target_col}_roll_mean_{window}'] = target.shift(1).rolling(window).mean()
+        features[f'{target_col}_roll_std_{window}'] = target.shift(1).rolling(window).std()
+
+    # Difference features
+    features[f'{target_col}_diff_1'] = target.shift(1) - target.shift(2)
+    features[f'{target_col}_diff_7'] = target.shift(1) - target.shift(8)
+
+    if reference_col and reference_col in df.columns:
+        ref = df[reference_col].astype(float)
+        features[f'{reference_col}_lag_1'] = ref.shift(1)
+        features[f'{reference_col}_lag_7'] = ref.shift(7)
+        features[f'{reference_col}_lag_14'] = ref.shift(14)
+
+        for window in [3, 7, 14, 30]:
+            features[f'{reference_col}_roll_mean_{window}'] = ref.shift(1).rolling(window).mean()
+            features[f'{reference_col}_roll_std_{window}'] = ref.shift(1).rolling(window).std()
+
+        ratio_raw = ref / np.clip(target, 1e-6, None)
+        features['call_to_ticket_ratio_lag1'] = ratio_raw.shift(1)
+        features['call_to_ticket_ratio_lag7'] = ratio_raw.shift(7)
+
+    if target_col == 'tickets_received' and 'tickets_resolved' in df.columns:
+        resolved = df['tickets_resolved'].astype(float)
+        backlog = target - resolved
+        features['estimated_backlog_lag1'] = backlog.shift(1)
+        features['estimated_backlog_roll_mean_7'] = backlog.shift(1).rolling(7).mean()
+
+    return features
+
+
+def train_feature_model(train_df, target_col, reference_col=None):
+    features = build_supervised_features(train_df, target_col, reference_col=reference_col)
+    target = train_df[target_col].astype(float)
+
+    supervised = features.copy()
+    supervised[target_col] = target.values
+    supervised = supervised.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(supervised) < 120:
+        raise ValueError(
+            f"Not enough samples to train feature model for {target_col}. "
+            "Need at least 120 rows after feature construction."
+        )
+
+    feature_cols = [col for col in supervised.columns if col != target_col]
+    X = supervised[feature_cols]
+    y = supervised[target_col]
+
+    selector_scaler = StandardScaler()
+    X_scaled = selector_scaler.fit_transform(X)
+    selector_estimator = Lasso(alpha=0.001, max_iter=20000)
+    selector_estimator.fit(X_scaled, y)
+
+    selected_features = [
+        name for name, coef in zip(feature_cols, np.abs(selector_estimator.coef_))
+        if coef > 1e-6
+    ]
+
+    if len(selected_features) < 8:
+        corr_scores = X.corrwith(y).abs().fillna(0.0)
+        selected_features = corr_scores.sort_values(ascending=False).head(min(20, len(corr_scores))).index.tolist()
+
+    model = Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', Ridge(alpha=1.0)),
+    ])
+    model.fit(X[selected_features], y)
+
+    return {
+        'model': model,
+        'selected_features': selected_features,
+    }
+
+
+def recursive_feature_forecast(train_df, target_col, horizon, reference_col=None, reference_future=None):
+    if reference_col and reference_future is None:
+        raise ValueError(f"reference_future is required when reference_col={reference_col}.")
+    if reference_future is not None and len(reference_future) < horizon:
+        raise ValueError("reference_future length is shorter than horizon.")
+
+    bundle = train_feature_model(train_df, target_col, reference_col=reference_col)
+    model = bundle['model']
+    selected_features = bundle['selected_features']
+
+    work_df = train_df.copy().reset_index(drop=True)
+    predictions = []
+
+    for step in range(horizon):
+        next_date = pd.to_datetime(work_df['date'].iloc[-1]) + pd.Timedelta(days=1)
+        next_row = {column: np.nan for column in work_df.columns}
+        next_row['date'] = next_date
+
+        if reference_col and reference_col in work_df.columns:
+            next_row[reference_col] = float(reference_future[step])
+
+        work_df = pd.concat([work_df, pd.DataFrame([next_row])], ignore_index=True)
+
+        feature_table = build_supervised_features(work_df, target_col, reference_col=reference_col)
+        latest_features = feature_table.iloc[-1].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        x_input = pd.DataFrame([latest_features[selected_features].to_dict()])
+        prediction = max(0.0, float(model.predict(x_input)[0]))
+        work_df.at[work_df.index[-1], target_col] = prediction
+        predictions.append(prediction)
+
+    return np.array(predictions), selected_features
+
+
+def evaluate_and_forecast_tickets_with_features(
+    df,
+    target_date_dt,
+    backtest_horizon,
+    rolling_windows,
+    call_future_p50,
+):
+    print("\n--- Processing tickets_received (feature model with call_volume reference) ---")
+
+    last_date = df['date'].max()
+    if target_date_dt <= last_date:
+        print(f"Error: Target date {target_date_dt.date()} must be after the last historical date {last_date.date()}.")
+        sys.exit(1)
+
+    future_horizon = (target_date_dt - last_date).days
+    print(f"Last historical date: {last_date.date()}")
+    print(f"Target forecasting date: {target_date_dt.date()}")
+    print(f"Future prediction length: {future_horizon} days")
+
+    base_columns = ['date', 'tickets_received', 'call_volume']
+    if 'tickets_resolved' in df.columns:
+        base_columns.append('tickets_resolved')
+    tickets_df = df[base_columns].copy().reset_index(drop=True)
+
+    print(
+        f"Starting rolling backtesting for tickets_received with engineered features "
+        f"({rolling_windows} windows x {backtest_horizon} days)..."
+    )
+
+    window_results = []
+    all_residuals = []
+    selected_feature_history = []
+
+    for window_index in range(rolling_windows):
+        test_end = len(tickets_df) - (window_index * backtest_horizon)
+        test_start = test_end - backtest_horizon
+        if test_start <= 120:
+            break
+
+        train_df = tickets_df.iloc[:test_start].copy()
+        test_df = tickets_df.iloc[test_start:test_end].copy()
+
+        # Backtest uses known call_volume in the evaluation window as reference signal.
+        reference_future = test_df['call_volume'].to_numpy()
+        predicted, selected_features = recursive_feature_forecast(
+            train_df,
+            target_col='tickets_received',
+            horizon=backtest_horizon,
+            reference_col='call_volume',
+            reference_future=reference_future,
+        )
+
+        y_true = test_df['tickets_received'].to_numpy()
+        smape, rmse = calculate_metrics(y_true, predicted)
+        residuals = y_true - predicted
+
+        window_results.append({
+            'window_index': window_index + 1,
+            'dates': test_df['date'].to_numpy(),
+            'actual': y_true,
+            'predicted': predicted,
+            'smape': smape,
+            'rmse': rmse,
+        })
+        all_residuals.extend(residuals.tolist())
+        selected_feature_history.append(selected_features)
+
+    if not window_results:
+        raise ValueError(
+            "Not enough history to run tickets feature-model backtests. "
+            "Reduce --backtest_horizon or --rolling_windows."
+        )
+
+    avg_smape = float(np.mean([row['smape'] for row in window_results]))
+    avg_rmse = float(np.mean([row['rmse'] for row in window_results]))
+    latest_window = window_results[0]
+    latest_window['avg_smape'] = avg_smape
+    latest_window['avg_rmse'] = avg_rmse
+    latest_window['windows_used'] = len(window_results)
+    latest_window['horizon'] = backtest_horizon
+
+    print("Backtesting Metrics for tickets_received:")
+    print(f"  Windows used: {latest_window['windows_used']}")
+    print(f"  Avg sMAPE: {avg_smape:.2%}")
+    print(f"  Avg RMSE: {avg_rmse:.2f}")
+
+    final_train_df = tickets_df.copy()
+    p50_future, selected_features = recursive_feature_forecast(
+        final_train_df,
+        target_col='tickets_received',
+        horizon=future_horizon,
+        reference_col='call_volume',
+        reference_future=call_future_p50,
+    )
+
+    residual_std = float(np.std(all_residuals)) if all_residuals else max(1.0, avg_rmse)
+    band = 1.2816 * residual_std
+    p10_future = np.maximum(0.0, p50_future - band)
+    p90_future = np.maximum(p50_future, p50_future + band)
+
+    print(f"  Selected feature count (final training): {len(selected_features)}")
+
+    future_dates = [last_date + pd.Timedelta(days=i) for i in range(1, future_horizon + 1)]
+    last_90_df = tickets_df.iloc[-90:]
+    future_results = {
+        'hist_dates': last_90_df['date'].values,
+        'hist_actual': last_90_df['tickets_received'].values,
+        'future_dates': future_dates,
+        'p10': p10_future,
+        'p50': p50_future,
+        'p90': p90_future,
+        'context_length': None,
+    }
+
+    return latest_window, future_results
 
 
 def run_rolling_backtest(series_data, series_name, pipeline, device, context_length, backtest_horizon, rolling_windows):
@@ -490,17 +743,13 @@ def main():
         context_candidates=context_candidates,
     )
 
-    # 2. Process Tickets Received
-    bt_ticket, fut_ticket = evaluate_and_forecast_series(
+    # 2. Process Tickets Received with engineered features
+    bt_ticket, fut_ticket = evaluate_and_forecast_tickets_with_features(
         df,
-        'tickets_received',
-        pipeline,
         target_date_dt,
-        device,
         args.backtest_horizon,
         args.rolling_windows,
-        fixed_context_length=args.context_length,
-        context_candidates=context_candidates,
+        call_future_p50=fut_call['p50'],
     )
 
     # 3. Generate Visualizations
