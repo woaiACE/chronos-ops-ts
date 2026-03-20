@@ -30,11 +30,61 @@ pip install -r requirements.txt
 ## 使用说明
 核心执行脚本为 `forecast.py`。您只需要传入一个未来需要预测的目标日期 `--target_date`（格式 `YYYY-MM-DD`）即可启动整个端到端的**回测验证 + 未来预测**流程。
 
-**示例命令：**
+**基础示例命令：**
 ```bash
 python forecast.py --target_date 2026-04-30
 ```
 *提示：指定的 `--target_date` 必须晚于 `data.csv` 中的最后一天记录，否则脚本会抛出友好提示。*
+
+### 1. 网络受限时，使用镜像地址
+如果您的网络无法直接访问 Hugging Face，可以通过 `--hf_endpoint` 指定镜像地址：
+
+```bash
+python forecast.py --target_date 2026-04-30 --hf_endpoint https://hf-mirror.com
+```
+
+### 2. 模型已在缓存或本地文件夹中，强制离线加载
+如果模型已经存在于本机缓存中，或者已提前下载到本地，可通过 `--local_files_only` 禁止联网请求：
+
+```bash
+python forecast.py --target_date 2026-04-30 --model_id amazon/chronos-t5-mini --local_files_only
+```
+
+### 3. 通过 `--model_id` 指定本地模型目录
+如果您已经将模型下载到仓库下的本地目录，可以把目录路径直接传给 `--model_id`：
+
+```bash
+python forecast.py --target_date 2026-04-30 --model_id local_chronos_model_mini --local_files_only
+```
+
+```bash
+python forecast.py --target_date 2026-04-30 --model_id local_chronos2_model --local_files_only
+```
+
+### 4. 通过滚动回测自动搜索更优的 `context_length`
+如果您希望针对当前业务数据自动搜索更优的历史窗口长度，可以使用以下参数：
+
+- `--backtest_horizon`: 回测预测天数。
+- `--rolling_windows`: 滚动回测窗口数量。
+- `--context_candidates`: 待搜索的历史窗口长度列表。
+- `--context_length`: 如果您已经知道最优窗口长度，可直接固定，不再自动搜索。
+
+**自动搜索示例：**
+```bash
+python forecast.py --target_date 2026-04-30 --model_id local_chronos2_model --local_files_only --backtest_horizon 14 --rolling_windows 4 --context_candidates 90,180,365,512,730
+```
+
+**固定窗口长度示例：**
+```bash
+python forecast.py --target_date 2026-04-30 --model_id local_chronos2_model --local_files_only --context_length 365 --backtest_horizon 14 --rolling_windows 4
+```
+
+如果您使用的是 Windows PowerShell，也可以先设置镜像环境变量，再运行脚本：
+
+```powershell
+$env:HF_ENDPOINT="https://hf-mirror.com"
+python forecast.py --target_date 2026-04-30
+```
 
 ---
 
