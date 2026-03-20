@@ -48,7 +48,8 @@ def generate_mock_data(filepath="data.csv", days=1100):
     })
 
     # Format date as YYYY/M/D to match the user's example
-    df['date'] = df['date'].dt.strftime('%Y/%-m/%-d')
+    # We use a cross-platform lambda instead of Linux-specific %-m and %-d
+    df['date'] = df['date'].apply(lambda dt: f"{dt.year}/{dt.month}/{dt.day}")
 
     df.to_csv(filepath, index=False)
     print(f"Mock data generated at {filepath} with {len(df)} rows.")

@@ -37,12 +37,20 @@ def load_and_preprocess_data(filepath="data.csv"):
     return df
 
 def calculate_metrics(y_true, y_pred):
-    # Using sklearn metrics
-    # Handle the case where y_true might have 0s for MAPE
-    # sklearn MAPE handles 0s by adding an epsilon, but let's be aware.
-    mape = mean_absolute_percentage_error(y_true, y_pred)
+    # Using Symmetric Mean Absolute Percentage Error (sMAPE)
+    # This natively handles true 0s better than standard MAPE which goes to inf.
+    # sMAPE formula: 100/n * sum( |y_true - y_pred| / ((|y_true| + |y_pred|)/2) )
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+
+    # Avoid division by zero where both true and pred are exactly 0
+    diff = np.abs(y_true - y_pred)
+    smape_array = np.zeros_like(diff, dtype=float)
+    nonzero_mask = denominator > 0
+    smape_array[nonzero_mask] = diff[nonzero_mask] / denominator[nonzero_mask]
+
+    smape = np.mean(smape_array)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    return mape, rmse
+    return smape, rmse
 
 def evaluate_and_forecast_series(df, series_name, pipeline, target_date_dt, device):
     print(f"\n--- Processing {series_name} ---")
@@ -94,10 +102,10 @@ def evaluate_and_forecast_series(df, series_name, pipeline, target_date_dt, devi
     p50_bt = np.median(forecast_bt_np, axis=0)
 
     y_true_bt = test_data_bt[series_name].values
-    mape, rmse = calculate_metrics(y_true_bt, p50_bt)
+    smape, rmse = calculate_metrics(y_true_bt, p50_bt)
 
     print(f"Backtesting Metrics for {series_name}:")
-    print(f"  MAPE: {mape:.2%}")
+    print(f"  sMAPE: {smape:.2%}")
     print(f"  RMSE: {rmse:.2f}")
 
     bt_results = {
@@ -213,10 +221,10 @@ def plot_future(future_results_call, future_results_ticket):
 def main():
     args = parse_args()
 
-    try:
-        target_date_dt = pd.to_datetime(args.target_date)
-    except ValueError:
-        print("Error: Invalid date format for --target_date. Use YYYY-MM-DD.")
+    # Safely parse the date, handling arbitrary formatting errors
+    target_date_dt = pd.to_datetime(args.target_date, errors='coerce')
+    if pd.isna(target_date_dt):
+        print(f"Error: Invalid date format for --target_date '{args.target_date}'. Please use YYYY-MM-DD.")
         sys.exit(1)
 
     df = load_and_preprocess_data("data.csv")
