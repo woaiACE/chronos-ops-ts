@@ -1,6 +1,5 @@
 import argparse
 import gc
-import json
 import os
 import sys
 from datetime import datetime
@@ -8,7 +7,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from chronos import Chronos2Pipeline, ChronosPipeline
+from chronos import BaseChronosPipeline, Chronos2Pipeline
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error
 
 def parse_args():
@@ -66,6 +65,15 @@ def load_and_preprocess_data(filepath="data.csv"):
     df = pd.read_csv(filepath)
     # Remove accidental empty columns exported by spreadsheets (e.g., "Unnamed: 4").
     df = df.loc[:, ~df.columns.str.startswith('Unnamed:')]
+
+    required_columns = ['date', 'call_volume', 'tickets_received']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns in {filepath}: {missing_columns}. "
+            "Expected columns: ['date', 'call_volume', 'tickets_received']."
+        )
+
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
 
@@ -115,33 +123,14 @@ def parse_context_candidates(raw_candidates):
     return sorted(set(candidates))
 
 
-def is_chronos2_model(model_id):
-    config_path = os.path.join(model_id, "config.json")
-    if not os.path.exists(config_path):
-        return False
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    return config.get("chronos_pipeline_class") == "Chronos2Pipeline"
-
-
 def load_pipeline(model_id, device, local_files_only=False):
-    pipeline_class = Chronos2Pipeline if is_chronos2_model(model_id) else ChronosPipeline
-    pipeline = pipeline_class.from_pretrained(
+    pipeline = BaseChronosPipeline.from_pretrained(
         model_id,
         device_map=device,
-        dtype=torch.float32,
+        torch_dtype=torch.float32,
         local_files_only=local_files_only,
     )
     return pipeline
-
-
-def get_quantile_indices(pipeline, quantiles):
-    if isinstance(pipeline, Chronos2Pipeline):
-        available_quantiles = pipeline.model.config.chronos_config["quantiles"]
-        return [available_quantiles.index(q) for q in quantiles]
-    return None
 
 
 def get_model_context_limit(pipeline):
@@ -158,19 +147,26 @@ def normalize_context_length(requested_context_length, history_length, model_con
 def predict_quantiles(pipeline, context_values, prediction_length, device, quantiles, num_samples):
     if isinstance(pipeline, Chronos2Pipeline):
         context_tensor = torch.tensor(context_values, dtype=torch.float32).reshape(1, 1, -1).to(device)
-        forecast = pipeline.predict(context_tensor, prediction_length=prediction_length)
-        forecast_np = forecast[0].cpu().numpy()[0]
-        quantile_indices = get_quantile_indices(pipeline, quantiles)
-        return [forecast_np[index] for index in quantile_indices]
+        quantile_forecast, _ = pipeline.predict_quantiles(
+            context_tensor,
+            prediction_length=prediction_length,
+            quantile_levels=quantiles,
+        )
+    else:
+        context_tensor = torch.tensor(context_values, dtype=torch.float32).unsqueeze(0).to(device)
+        quantile_forecast, _ = pipeline.predict_quantiles(
+            context_tensor,
+            prediction_length=prediction_length,
+            quantile_levels=quantiles,
+            num_samples=num_samples,
+        )
 
-    context_tensor = torch.tensor(context_values, dtype=torch.float32).unsqueeze(0).to(device)
-    forecast = pipeline.predict(
-        context_tensor,
-        prediction_length=prediction_length,
-        num_samples=num_samples,
-    )
-    forecast_np = forecast.cpu().numpy()[0]
-    return [np.percentile(forecast_np, q * 100, axis=0) if q not in (0.5,) else np.median(forecast_np, axis=0) for q in quantiles]
+    if isinstance(quantile_forecast, list):
+        quantile_np = quantile_forecast[0].cpu().numpy()[0]
+    else:
+        quantile_np = quantile_forecast.cpu().numpy()[0]
+
+    return [quantile_np[:, index] for index, _ in enumerate(quantiles)]
 
 
 def run_rolling_backtest(series_data, series_name, pipeline, device, context_length, backtest_horizon, rolling_windows):
@@ -435,6 +431,10 @@ def main():
         print("Error: --backtest_horizon and --rolling_windows must be positive integers.")
         sys.exit(1)
 
+    if args.context_length is not None and args.context_length <= 0:
+        print("Error: --context_length must be a positive integer when provided.")
+        sys.exit(1)
+
     try:
         context_candidates = parse_context_candidates(args.context_candidates)
     except ValueError as e:
@@ -451,7 +451,11 @@ def main():
         print(f"Error: Invalid date format for --target_date '{args.target_date}'. Please use YYYY-MM-DD.")
         sys.exit(1)
 
-    df = load_and_preprocess_data("data.csv")
+    try:
+        df = load_and_preprocess_data("data.csv")
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     # Setup device strictly for CPU inference per requirements
     device = "cpu"
