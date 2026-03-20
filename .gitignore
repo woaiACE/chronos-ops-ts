@@ -1,0 +1,6 @@
+.conda/
+local_chronos_model_mini/
+local_chronos2_model/
+__pycache__/
+.vscode/
+*.png
