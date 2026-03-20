@@ -1,0 +1,27 @@
+# Global configuration for forecasting runs.
+# You can override any field from CLI, e.g.:
+# python main.py --target_date 2026-04-30 --context_ensemble_topk 5
+
+target_date: "2026-04-30"
+model_id: "local_chronos2_model"
+hf_endpoint: null
+local_files_only: true
+
+# Chronos context search
+context_length: null
+context_candidates: "auto"
+context_search_points: 50
+context_ensemble_topk: 3
+
+# Backtest and rolling settings
+backtest_horizon: 30
+rolling_windows: 4
+auto_backtest_horizon: true
+
+# Residual correction and interval calibration
+residual_weight_search_points: 21
+direct_weight_search_points: 11
+leadwise_weight_search_points: 11
+interval_coverage: 0.8
+disable_interval_calibration: false
+disable_leadwise_correction: false
