@@ -3,6 +3,7 @@ import pandas as pd
 import time
 from sklearn.base import clone
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression
 from sklearn.linear_model import Lasso, Ridge
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
@@ -14,6 +15,9 @@ STATE_TO_CODE = {
     'weekend': 1,
     'holiday_or_makeup': 2,
 }
+
+ZERO_TARGET_THRESHOLD = 1.0
+SCENARIO_MIN_SAMPLES = 60
 
 
 def calculate_metrics(y_true, y_pred):
@@ -76,13 +80,15 @@ def build_holiday_proximity_features(date_series, holiday_fn=None, makeup_fn=Non
 
             found = 0
             probe = end + 1
-            while probe < n_rows and found < 3:
+            while probe < n_rows and found < 8:
                 if (not holiday_mask[probe]) and workday_mask[probe]:
                     found += 1
                     post_holiday_workday_n[probe] = found
                 probe += 1
 
         start = end + 1
+
+    recovery_weight = np.clip(post_holiday_workday_n.astype(float) / 8.0, 0.0, 1.0)
 
     return pd.DataFrame({
         f'{feature_prefix}pre_holiday_n_day': pre_holiday_n_day,
@@ -92,6 +98,12 @@ def build_holiday_proximity_features(date_series, holiday_fn=None, makeup_fn=Non
         f'{feature_prefix}is_post_holiday_workday_1': (post_holiday_workday_n == 1).astype(int),
         f'{feature_prefix}is_post_holiday_workday_2': (post_holiday_workday_n == 2).astype(int),
         f'{feature_prefix}is_post_holiday_workday_3': (post_holiday_workday_n == 3).astype(int),
+        f'{feature_prefix}is_post_holiday_workday_4': (post_holiday_workday_n == 4).astype(int),
+        f'{feature_prefix}is_post_holiday_workday_5': (post_holiday_workday_n == 5).astype(int),
+        f'{feature_prefix}is_post_holiday_workday_6': (post_holiday_workday_n == 6).astype(int),
+        f'{feature_prefix}is_post_holiday_workday_7': (post_holiday_workday_n == 7).astype(int),
+        f'{feature_prefix}is_post_holiday_workday_8': (post_holiday_workday_n == 8).astype(int),
+        f'{feature_prefix}post_holiday_recovery_weight': recovery_weight,
     })
 
 
@@ -331,12 +343,26 @@ def _fit_direct_model(lead_frame, feature_cols):
     # On long histories HGB selection can be very slow on Windows and block the whole pipeline.
     # Use a fast ridge path to keep end-to-end forecasting (including plotting) responsive.
     if len(clean_frame) >= 500:
+        val_size = min(28, max(7, len(clean_frame) // 20))
+        train_size = len(clean_frame) - val_size
+        X_train = X.iloc[:train_size]
+        y_train = y.iloc[:train_size]
+        X_val = X.iloc[train_size:]
+        y_val = y.iloc[train_size:]
+
         model = Pipeline([
             ('scaler', StandardScaler()),
             ('regressor', Ridge(alpha=2.0)),
         ])
-        model.fit(X, np.log1p(np.clip(y, 0.0, None)))
-        return model, 'ridge_large_sample', None
+
+        y_train_log = np.log1p(np.clip(y_train, 0.0, None))
+        model.fit(X_train, y_train_log)
+        val_pred = np.maximum(0.0, np.expm1(model.predict(X_val)))
+        val_smape, _ = calculate_metrics(y_val.to_numpy(), val_pred)
+
+        y_full_log = np.log1p(np.clip(y, 0.0, None))
+        model.fit(X, y_full_log)
+        return model, 'ridge_large_sample', float(val_smape)
 
     val_size = min(28, max(7, len(clean_frame) // 8))
     train_size = len(clean_frame) - val_size
@@ -364,6 +390,68 @@ def _fit_direct_model(lead_frame, feature_cols):
     y_full_log = np.log1p(np.clip(y, 0.0, None))
     best_model.fit(X, y_full_log)
     return best_model, best_name, float(best_smape)
+
+
+def _fit_two_stage_direct_model(lead_frame, feature_cols):
+    clean_frame = lead_frame.replace([np.inf, -np.inf], np.nan).dropna(subset=feature_cols + ['target'])
+    if clean_frame.empty:
+        return None, 'fallback_two_stage', None
+
+    X = clean_frame[feature_cols]
+    y = clean_frame['target'].astype(float)
+    y_zero = (y <= ZERO_TARGET_THRESHOLD).astype(int)
+
+    classifier = None
+    classifier_name = 'zero_rule_base_rate'
+    if y_zero.nunique() >= 2 and len(clean_frame) >= 36:
+        classifier = Pipeline([
+            ('scaler', StandardScaler()),
+            ('classifier', LogisticRegression(max_iter=500, class_weight='balanced')),
+        ])
+        classifier.fit(X, y_zero)
+        classifier_name = 'logistic_zero_classifier'
+
+    positive_frame = clean_frame[clean_frame['target'] > ZERO_TARGET_THRESHOLD]
+    reg_train_frame = positive_frame if len(positive_frame) >= 24 else clean_frame
+    regressor, regressor_name, _ = _fit_direct_model(reg_train_frame, feature_cols)
+    if regressor is None:
+        return None, 'fallback_two_stage', None
+
+    val_size = min(28, max(7, len(clean_frame) // 8))
+    train_size = len(clean_frame) - val_size
+    X_val = X.iloc[train_size:]
+    y_val = y.iloc[train_size:]
+
+    reg_pred = np.maximum(0.0, np.expm1(regressor.predict(X_val)))
+    if classifier is None:
+        zero_prob = float(y_zero.iloc[:train_size].mean()) if train_size > 0 else float(y_zero.mean())
+        zero_prob = np.full(shape=len(X_val), fill_value=zero_prob, dtype=float)
+    else:
+        zero_prob = classifier.predict_proba(X_val)[:, 1]
+
+    final_pred = np.maximum(0.0, (1.0 - zero_prob) * reg_pred)
+    val_smape, _ = calculate_metrics(y_val.to_numpy(), final_pred)
+
+    model_bundle = {
+        'classifier': classifier,
+        'regressor': regressor,
+        'zero_base_rate': float(y_zero.mean()),
+    }
+    model_name = f"two_stage[{classifier_name}+{regressor_name}]"
+    return model_bundle, model_name, float(val_smape)
+
+
+def _predict_with_two_stage_model(model_bundle, future_features):
+    regressor = model_bundle['regressor']
+    classifier = model_bundle.get('classifier')
+    reg_pred = np.maximum(0.0, np.expm1(regressor.predict(future_features)))
+
+    if classifier is None:
+        zero_prob = np.full(shape=len(future_features), fill_value=float(model_bundle.get('zero_base_rate', 0.0)), dtype=float)
+    else:
+        zero_prob = classifier.predict_proba(future_features)[:, 1]
+
+    return np.maximum(0.0, (1.0 - zero_prob) * reg_pred)
 
 
 def train_feature_model(train_df, target_col, reference_col=None, holiday_fn=None, makeup_fn=None):
@@ -500,15 +588,51 @@ def forecast_direct_multistep(
         lead_train = historical_frame[historical_frame['lead'] == lead].reset_index(drop=True)
         lead_future = future_frame[future_frame['lead'] == lead].reset_index(drop=True)
 
-        model, model_name, val_smape = _fit_direct_model(lead_train, feature_cols)
-        if model is None:
+        model_bundle, model_name, val_smape = _fit_two_stage_direct_model(lead_train, feature_cols)
+        scenario_model_count = 0
+
+        scenario_col = None
+        if 'forecast_state_code' in lead_train.columns:
+            scenario_col = 'forecast_state_code'
+        elif 'operational_state_code' in lead_train.columns:
+            scenario_col = 'operational_state_code'
+
+        scenario_models = {}
+        if scenario_col is not None:
+            for state_code in sorted(set(STATE_TO_CODE.values())):
+                state_frame = lead_train[lead_train[scenario_col] == state_code].copy()
+                if len(state_frame) < SCENARIO_MIN_SAMPLES:
+                    continue
+
+                state_positive = int((state_frame['target'].astype(float) > ZERO_TARGET_THRESHOLD).sum())
+                if state_positive < 20:
+                    continue
+
+                state_bundle, _, _ = _fit_two_stage_direct_model(state_frame, feature_cols)
+                if state_bundle is not None:
+                    scenario_models[int(state_code)] = state_bundle
+
+            scenario_model_count = len(scenario_models)
+
+        if model_bundle is None:
             pred_value = _fallback_point_prediction(lead_future.iloc[0], target_col)
         else:
             future_features = lead_future[feature_cols].replace([np.inf, -np.inf], np.nan)
             if future_features.isna().any().any():
                 pred_value = _fallback_point_prediction(lead_future.iloc[0], target_col)
             else:
-                pred_value = max(0.0, float(np.expm1(model.predict(future_features)[0])))
+                active_bundle = model_bundle
+                if scenario_col is not None and scenario_models:
+                    raw_state = lead_future.iloc[0].get(scenario_col)
+                    if pd.notna(raw_state):
+                        state_code = int(raw_state)
+                        if state_code in scenario_models:
+                            active_bundle = scenario_models[state_code]
+
+                pred_value = float(_predict_with_two_stage_model(active_bundle, future_features)[0])
+
+        if scenario_model_count > 0:
+            model_name = f"{model_name}+scenario({scenario_model_count})"
 
         predictions.append(pred_value)
         model_summaries.append({

@@ -47,6 +47,18 @@ pip install -r requirements.txt
 python main.py
 ```
 
+每次启动会提示选择运行档位：`quick` 或 `formal`。
+
+- `quick`: 使用加速参数（更快出结果）
+- `formal`: 使用配置文件原参数（正式评估）
+
+如果需要非交互执行（如脚本/CI），可显式指定：
+
+```bash
+python main.py --profile quick
+python main.py --profile formal
+```
+
 覆盖目标日期运行：
 
 ```bash
@@ -88,7 +100,7 @@ python main.py --target_date 2026-04-30 --disable_interval_calibration
 ### 3. 日历能力初始化
 
 - 如果环境中安装了 `chinese-calendar`，则启用法定节假日与补班日识别
-- 如果未安装，则退化为“周末近似节假日”逻辑
+- 如果未安装，则仅区分工作日/周末，不识别法定节假日与补班日
 
 ### 4. Chronos 基线回测与未来预测
 
@@ -174,7 +186,10 @@ python main.py --target_date 2026-04-30 --disable_interval_calibration
 - `residual_weight_search_points`: 状态分段残差权重搜索粒度
 - `direct_weight_search_points`: `call_volume` 与 `tickets_received` 的 Chronos/direct 融合权重搜索粒度
 - `leadwise_weight_search_points`: Lead-wise 纠偏权重搜索粒度
+- `leadwise_weight_cap`: Lead-wise 强度上限（守护阈值，建议线上可设 0.8）
 - `interval_coverage`: 区间后校准目标覆盖率
+- `monitor_recent_days`: 分桶监控报告中“recent”窗口天数（默认 84）
+- `monitor_low_sample_threshold`: 报告低样本阈值（默认 12，低于阈值会标记为低置信度）
 - `disable_interval_calibration`: 是否关闭区间后校准
 - `disable_leadwise_correction`: 是否关闭 lead-wise 分层纠偏
 
@@ -185,9 +200,39 @@ python main.py --target_date 2026-04-30 --disable_interval_calibration
 - `outputs/csv/forecast_export.csv`: 标准化导出（`date,target_name,p10,p50,p90`）
 - `outputs/csv/feature_engineering_merged.csv`: call+tickets 合并后的完整特征工程明细
 - `outputs/csv/direct_model_summary_merged.csv`: call+tickets 合并后的各预测步长模型摘要
+- `outputs/csv/monitor_bucket_report.csv`: 分桶监控报告（all/recent，含 holiday、post_holiday_workday_1_3、workday_normal 等桶）
+- `outputs/csv/monitor_bucket_history_profile.csv`: 历史分桶画像（history_all/history_recent，含样本数、均值、标准差、零值占比）
 - `outputs/png/evaluation_results.png`: 回测对比图
 - `outputs/png/future_forecast.png`: 历史 + 未来预测图
 - `outputs/png/forecast_export_plot.png`: 仅基于导出 CSV 的预测图
+- `outputs/png/monitor_bucket_sample_scope.png`: 样本口径对照图（最近窗口双柱 + 全历史折线双轴）
+
+## 业务阅读指南
+
+建议按下面顺序阅读生成的 Markdown 报告：
+
+1. 先看“一页结论”与“风险提示”，快速判断近期是否存在明显风险桶。
+2. 再看“样本口径说明”，确认表格中的样本数是 recent 还是 all。
+3. 然后看“分场景表现”，对普通工作日、节假日、节后1-3工作日分别解读。
+4. 最后看“未来预测摘要”和配图，判断未来高峰与区间宽度。
+
+### 样本口径避免误读
+
+- `回测样本数`：表示最近监控窗口内，真正参与误差评估的样本数。
+- `历史样本数(最近窗口)`：表示最近监控窗口内，该场景在真实历史里出现了多少次。
+- `历史样本数(全历史)`：表示从数据起始日到当前，全历史里该场景一共出现了多少次。
+- `法定节假日` 仅统计法定节假日，不包含普通周末；普通周末单独计入 `周末` 场景。
+
+例如：如果报告中显示“普通工作日 回测样本数 22，历史样本数(最近窗口) 20，历史样本数(全历史) 302”，意思是：
+
+- 最近窗口里普通工作日样本大约 20 多天；
+- 全历史里普通工作日远不止 20 天；
+- 不能把 recent 样本误解为全历史总量。
+
+### 图表中文化说明
+
+- 当前图表标题、图例、坐标轴均已统一为中文。
+- 绘图时会优先尝试加载 Windows 常见中文字体（如 `Microsoft YaHei`、`SimHei`），并自动回退到默认字体，降低中文乱码风险。
 
 ## 当前代码流程核对结论
 

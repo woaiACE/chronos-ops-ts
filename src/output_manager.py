@@ -2,12 +2,18 @@ import os
 import pandas as pd
 
 
-def ensure_output_dirs(base_dir="outputs"):
+def ensure_output_dirs(base_dir=None):
+    if base_dir is None:
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        base_dir = os.path.join(project_root, "outputs")
+
     csv_dir = os.path.join(base_dir, "csv")
     png_dir = os.path.join(base_dir, "png")
+    report_dir = os.path.join(base_dir, "report")
     os.makedirs(csv_dir, exist_ok=True)
     os.makedirs(png_dir, exist_ok=True)
-    return csv_dir, png_dir
+    os.makedirs(report_dir, exist_ok=True)
+    return csv_dir, png_dir, report_dir
 
 
 def export_forecast_csv(fut_call, fut_ticket, output_csv_path):
@@ -37,3 +43,9 @@ def export_forecast_csv(fut_call, fut_ticket, output_csv_path):
 def export_dataframe_csv(df, output_csv_path):
     df.to_csv(output_csv_path, index=False)
     return output_csv_path
+
+
+def export_markdown_report(report_text, output_path):
+    with open(output_path, 'w', encoding='utf-8') as report_file:
+        report_file.write(report_text)
+    return output_path

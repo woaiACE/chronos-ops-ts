@@ -1,27 +1,251 @@
-# Global configuration for forecasting runs.
-# You can override any field from CLI, e.g.:
-# python main.py --target_date 2026-04-30 --context_ensemble_topk 5
-
+# 预测截止日期（必须晚于数据最后一天）
 target_date: "2026-04-30"
+# Chronos 模型路径或模型 ID（当前使用本地 Chronos2）
 model_id: "local_chronos2_model"
+# Hugging Face 镜像地址（不使用时填 null）
 hf_endpoint: null
+# 是否仅使用本地文件加载模型（离线环境建议 true）
 local_files_only: true
 
-# Chronos context search
+# 固定上下文长度（null 表示自动搜索）
 context_length: null
+# 上下文候选（auto 表示自动生成候选集合）
 context_candidates: "auto"
+# 自动上下文搜索点数（越大越慢但可能更准）
 context_search_points: 50
+# 上下文融合 Top-K（>1 表示融合多个 context）
 context_ensemble_topk: 3
 
-# Backtest and rolling settings
+# 回测窗口天数（自动对齐开启时会根据预测步长调整）
 backtest_horizon: 30
+# 滚动回测窗口个数（越大越稳但耗时更高）
 rolling_windows: 4
+# 是否启用回测窗口自动对齐
 auto_backtest_horizon: true
 
-# Residual correction and interval calibration
+# 残差权重搜索粒度（越大搜索更细）
 residual_weight_search_points: 21
+# Chronos+Direct 融合权重搜索粒度
 direct_weight_search_points: 11
+# Lead-wise 权重搜索粒度
 leadwise_weight_search_points: 11
+# 全局 Lead-wise 强度上限（未配置分序列时作为兜底）
+leadwise_weight_cap: 1.0
+# 区间目标覆盖率（例如 0.8 对应 80%）
 interval_coverage: 0.8
+# 分桶监控报告 recent 窗口天数
+monitor_recent_days: 84
+# 分桶报告低样本阈值（低于此阈值将标记为低置信度）
+monitor_low_sample_threshold: 12
+# 是否关闭区间后校准
 disable_interval_calibration: false
+# 是否关闭 Lead-wise 分层纠偏
 disable_leadwise_correction: false
+# 是否关闭特征明细导出
+disable_feature_export: false
+# 特征明细导出行数上限（0 表示不限制）
+feature_export_rows_limit: 0
+
+# 分序列调参（把需手动调的参数统一放到这里）
+series_tuning:
+  # 电话序列调参
+  call_volume:
+    # 电话 Lead-wise 强度上限（按建议更保守）
+    leadwise_weight_cap: 0.75
+    # 电话节假日段残差小模型权重（按建议下调）
+    holiday_segment_model_weight: 0.58
+    # 电话节后第1-3工作日锚点强度（按建议轻微下调）
+    post_holiday_anchor_strengths:
+      # 节后第1工作日默认锚点强度
+      day1_default: 0.40
+      # 节后第1工作日高零值场景强锚点强度
+      day1_strong: 0.55
+      # 节后第2工作日默认锚点强度
+      day2_default: 0.30
+      # 节后第2工作日高零值场景强锚点强度
+      day2_strong: 0.45
+      # 节后第3工作日默认锚点强度
+      day3_default: 0.20
+      # 节后第3工作日高零值场景强锚点强度
+      day3_strong: 0.35
+    # 分层节假日残差建模（春节停工/值班、长假核心、普通节假日）
+    holiday_layered_model:
+      # 是否启用分层节假日小模型
+      enabled: true
+      # 每个分层最小样本数
+      min_samples: 8
+      # 分层模型融合权重（越高越依赖分层结果）
+      blend_weight: 0.45
+    # 分桶偏差闸门（在线后处理）
+    bias_gate:
+      # 是否启用分桶偏差闸门
+      enabled: true
+      # 使用最近多少天回测统计来判断偏差
+      recent_days: 84
+      # 生效所需最小样本数
+      min_samples: 6
+      # 目标分桶（支持多场景）
+      target_buckets: ["holiday", "post_holiday_workday_1_3"]
+      # 按桶额外缩放（用于只增强某些桶，不影响其他桶）
+      bucket_scales:
+        holiday: 1.0
+        post_holiday_workday_1_3: 1.25
+      # 是否仅在正偏差（高估）时触发
+      only_positive_bias: true
+      # 触发阈值（绝对偏差）
+      bias_trigger: 0.8
+      # 调整系数（越大修正越强）
+      adjustment_scale: 0.58
+      # 单日最大调整比例（相对 p50）
+      max_adjustment_ratio: 0.16
+      # RMSE 护栏（限制单日修正量，避免RMSE恶化）
+      enforce_rmse_guard: true
+      # RMSE 护栏比例：单日修正量 <= 该比例 * 桶RMSE
+      rmse_guard_scale: 0.60
+      # recent 样本不足时是否回退到 all 统计
+      allow_scope_fallback: true
+      # 回退到 all 统计时的缩放系数
+      fallback_scale: 0.60
+      # 低样本场景是否启用软闸门（按样本占比降权）
+      allow_low_sample_gate: true
+      # 低样本降权下限，避免完全失效
+      low_sample_floor: 0.35
+    # 分序列动态 Lead-wise 上限
+    dynamic_leadwise_cap:
+      # 是否启用动态上限
+      enabled: true
+      # 使用 recent 窗口天数
+      recent_days: 84
+      # recent sMAPE 高阈值（超过则下调 cap）
+      smape_high: 0.16
+      # recent sMAPE 低阈值（低于则上调 cap）
+      smape_low: 0.12
+      # 下调幅度
+      down_shift: 0.10
+      # 上调幅度
+      up_shift: 0.03
+      # 动态 cap 下界
+      min_cap: 0.55
+      # 动态 cap 上界
+      max_cap: 0.85
+    # 分桶融合权重二次学习
+    bucket_fusion_secondary:
+      # 是否启用二次学习
+      enabled: true
+      # 每个桶最小样本数
+      min_samples: 8
+      # 是否对节假日桶进一步按子场景分层学习融合权重
+      enable_holiday_layers: true
+      # 节假日子场景最小样本数
+      holiday_min_samples: 6
+    # 非对称区间校准（上行/下行分开）
+    asymmetric_interval:
+      # 是否启用非对称校准
+      enabled: true
+      # 下行半径分位点
+      lower_coverage: 0.80
+      # 上行半径分位点
+      upper_coverage: 0.80
+  # 工单序列调参
+  tickets_received:
+    # 工单 Lead-wise 强度上限
+    leadwise_weight_cap: 0.80
+    # 工单节假日段残差小模型权重
+    holiday_segment_model_weight: 0.75
+    # 工单节后第1-3工作日锚点强度（保持原默认）
+    post_holiday_anchor_strengths:
+      # 节后第1工作日默认锚点强度
+      day1_default: 0.45
+      # 节后第1工作日高零值场景强锚点强度
+      day1_strong: 0.60
+      # 节后第2工作日默认锚点强度
+      day2_default: 0.35
+      # 节后第2工作日高零值场景强锚点强度
+      day2_strong: 0.50
+      # 节后第3工作日默认锚点强度
+      day3_default: 0.25
+      # 节后第3工作日高零值场景强锚点强度
+      day3_strong: 0.40
+    # 分层节假日残差建模（春节停工/值班、长假核心、普通节假日）
+    holiday_layered_model:
+      # 是否启用分层节假日小模型
+      enabled: true
+      # 每个分层最小样本数
+      min_samples: 4
+      # 分层模型融合权重（越高越依赖分层结果）
+      blend_weight: 0.70
+    # 分桶偏差闸门（在线后处理）
+    bias_gate:
+      # 是否启用分桶偏差闸门
+      enabled: true
+      # 使用最近多少天回测统计来判断偏差
+      recent_days: 84
+      # 生效所需最小样本数
+      min_samples: 8
+      # 目标分桶（支持多场景）
+      target_buckets: ["holiday", "post_holiday_workday_1_3"]
+      # 是否仅在正偏差（高估）时触发
+      only_positive_bias: false
+      # 触发阈值（绝对偏差）
+      bias_trigger: 0.8
+      # 调整系数（越大修正越强）
+      adjustment_scale: 0.30
+      # 单日最大调整比例（相对 p50）
+      max_adjustment_ratio: 0.10
+      # recent 样本不足时是否回退到 all 统计
+      allow_scope_fallback: true
+      # 回退到 all 统计时的缩放系数
+      fallback_scale: 0.60
+      # 低样本场景是否启用软闸门（按样本占比降权）
+      allow_low_sample_gate: true
+      # 低样本降权下限，避免完全失效
+      low_sample_floor: 0.35
+    # 分序列动态 Lead-wise 上限
+    dynamic_leadwise_cap:
+      # 是否启用动态上限
+      enabled: true
+      # 使用 recent 窗口天数
+      recent_days: 84
+      # recent sMAPE 高阈值（超过则下调 cap）
+      smape_high: 0.18
+      # recent sMAPE 低阈值（低于则上调 cap）
+      smape_low: 0.12
+      # 下调幅度
+      down_shift: 0.08
+      # 上调幅度
+      up_shift: 0.03
+      # 动态 cap 下界
+      min_cap: 0.60
+      # 动态 cap 上界
+      max_cap: 0.90
+    # 分桶融合权重二次学习
+    bucket_fusion_secondary:
+      # 是否启用二次学习
+      enabled: true
+      # 每个桶最小样本数
+      min_samples: 8
+      # 是否对节假日桶进一步按子场景分层学习融合权重
+      enable_holiday_layers: true
+      # 节假日子场景最小样本数
+      holiday_min_samples: 6
+    # 非对称区间校准（上行/下行分开）
+    asymmetric_interval:
+      # 是否启用非对称校准
+      enabled: true
+      # 下行半径分位点
+      lower_coverage: 0.80
+      # 上行半径分位点
+      upper_coverage: 0.80
+
+# 春节停工/值班规则（可按年份和日期覆盖）
+spring_service_rules:
+  # 默认规则（按连续春节法定休假块中的位置判定）
+  default:
+    # 默认停工日位置
+    shutdown_positions: [2, 3, 4, 5]
+    # 默认值班日位置
+    duty_positions: [1, 6, 7, 8, 9]
+  # 按年份覆盖默认规则（不需要时保持空字典）
+  year_overrides: {}
+  # 按日期强制覆盖（可选值 shutdown/duty/none）
+  date_overrides: {}
