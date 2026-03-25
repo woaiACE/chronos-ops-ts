@@ -64,12 +64,27 @@ def _series_display_name(series_name):
     return SERIES_DISPLAY_NAMES.get(str(series_name), str(series_name))
 
 
+def _flatten_backtest_series(bt_results):
+    windows = bt_results.get('all_windows', []) if isinstance(bt_results, dict) else []
+    if not windows:
+        return bt_results['dates'], bt_results['actual'], bt_results['predicted']
+
+    ordered_windows = sorted(windows, key=lambda w: int(w.get('window_index', 0)), reverse=True)
+    dates = np.concatenate([np.asarray(window['dates']) for window in ordered_windows])
+    actual = np.concatenate([np.asarray(window['actual'], dtype=float) for window in ordered_windows])
+    predicted = np.concatenate([np.asarray(window['predicted'], dtype=float) for window in ordered_windows])
+    return dates, actual, predicted
+
+
 def plot_evaluation(bt_results_call, bt_results_ticket, output_path):
     _configure_chinese_font()
     fig, axes = plt.subplots(2, 1, figsize=(12, 10))
 
-    axes[0].plot(bt_results_call['dates'], bt_results_call['actual'], label='实际值', marker='o')
-    axes[0].plot(bt_results_call['dates'], bt_results_call['predicted'], label='预测值(P50)', marker='x')
+    call_dates, call_actual, call_predicted = _flatten_backtest_series(bt_results_call)
+    ticket_dates, ticket_actual, ticket_predicted = _flatten_backtest_series(bt_results_ticket)
+
+    axes[0].plot(call_dates, call_actual, label='实际值', marker='o')
+    axes[0].plot(call_dates, call_predicted, label='预测值(P50)', marker='x')
     axes[0].set_title(
         f"电话量回测结果（{bt_results_call['windows_used']}个窗口 x {bt_results_call['horizon']}天）"
     )
@@ -77,8 +92,8 @@ def plot_evaluation(bt_results_call, bt_results_ticket, output_path):
     axes[0].grid(True)
     axes[0].legend()
 
-    axes[1].plot(bt_results_ticket['dates'], bt_results_ticket['actual'], label='实际值', marker='o', color='green')
-    axes[1].plot(bt_results_ticket['dates'], bt_results_ticket['predicted'], label='预测值(P50)', marker='x', color='orange')
+    axes[1].plot(ticket_dates, ticket_actual, label='实际值', marker='o', color='green')
+    axes[1].plot(ticket_dates, ticket_predicted, label='预测值(P50)', marker='x', color='orange')
     axes[1].set_title(
         f"工单量回测结果（{bt_results_ticket['windows_used']}个窗口 x {bt_results_ticket['horizon']}天）"
     )

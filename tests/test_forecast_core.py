@@ -16,6 +16,8 @@ from src.forecast import (
 )
 import src.forecast as forecast_module
 from src.visualization import plot_monitor_bucket_sample_scope
+from src.output_manager import export_forecast_csv
+from src.visualization import plot_evaluation
 
 
 def test_parse_context_candidates_sorted_deduplicated():
@@ -326,3 +328,76 @@ def test_apply_bucket_bias_gate_rmse_guard_limits_adjustment(monkeypatch):
     # raw_adj=50, 但rmse护栏上限=0.2*5=1，因此仅调整1
     assert adjusted['p50'][0] == pytest.approx(99.0)
     assert bool(info.get('enforce_rmse_guard', False)) is True
+
+
+def test_export_forecast_csv_raises_on_length_mismatch(tmp_path):
+    fut_call = {
+        'future_dates': pd.to_datetime(['2026-01-01', '2026-01-02']),
+        'p10': np.array([1.0, 2.0]),
+        'p50': np.array([2.0, 3.0]),
+        'p90': np.array([3.0]),
+    }
+    fut_ticket = {
+        'future_dates': pd.to_datetime(['2026-01-01']),
+        'p10': np.array([1.0]),
+        'p50': np.array([2.0]),
+        'p90': np.array([3.0]),
+    }
+
+    with pytest.raises(ValueError):
+        export_forecast_csv(fut_call, fut_ticket, tmp_path / 'forecast.csv')
+
+
+def test_plot_evaluation_uses_all_windows_payload(tmp_path):
+    import matplotlib
+
+    matplotlib.use('Agg')
+
+    bt_call = {
+        'windows_used': 2,
+        'horizon': 2,
+        'dates': np.array(['2026-01-03', '2026-01-04']),
+        'actual': np.array([3.0, 4.0]),
+        'predicted': np.array([3.1, 4.1]),
+        'all_windows': [
+            {
+                'window_index': 1,
+                'dates': np.array(['2026-01-03', '2026-01-04']),
+                'actual': np.array([3.0, 4.0]),
+                'predicted': np.array([3.1, 4.1]),
+            },
+            {
+                'window_index': 2,
+                'dates': np.array(['2026-01-01', '2026-01-02']),
+                'actual': np.array([1.0, 2.0]),
+                'predicted': np.array([1.1, 2.1]),
+            },
+        ],
+    }
+    bt_ticket = {
+        'windows_used': 2,
+        'horizon': 2,
+        'dates': np.array(['2026-01-03', '2026-01-04']),
+        'actual': np.array([6.0, 8.0]),
+        'predicted': np.array([5.9, 7.9]),
+        'all_windows': [
+            {
+                'window_index': 1,
+                'dates': np.array(['2026-01-03', '2026-01-04']),
+                'actual': np.array([6.0, 8.0]),
+                'predicted': np.array([5.9, 7.9]),
+            },
+            {
+                'window_index': 2,
+                'dates': np.array(['2026-01-01', '2026-01-02']),
+                'actual': np.array([2.0, 4.0]),
+                'predicted': np.array([2.1, 4.1]),
+            },
+        ],
+    }
+
+    output_path = tmp_path / 'evaluation_results.png'
+    plot_evaluation(bt_call, bt_ticket, output_path)
+
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0

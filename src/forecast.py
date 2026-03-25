@@ -29,7 +29,7 @@ try:
     calendar_module_name = "chinese" + "_calendar"
     cn_calendar = importlib.import_module(calendar_module_name)
     HAS_CN_CALENDAR = True
-except Exception:
+except ModuleNotFoundError:
     cn_calendar = None
     HAS_CN_CALENDAR = False
 
@@ -982,13 +982,16 @@ def build_residual_adjuster(bt_results, holiday_segment_model_weight=0.75, holid
             'predicted',
         ]
         state_clean = state_group[feature_cols + ['residual']].replace([np.inf, -np.inf], np.nan).dropna()
-        if len(state_clean) >= 2:
+        state_model_min_samples = max(12, len(feature_cols) + 4)
+        if len(state_clean) >= state_model_min_samples:
             model = Ridge(alpha=1.0)
             model.fit(state_clean[feature_cols], state_clean['residual'])
             state_models[state_name] = {
                 'model': model,
                 'feature_cols': feature_cols,
                 'fallback_bias': float(state_bias[state_name]),
+                'sample_size': int(len(state_clean)),
+                'min_samples': int(state_model_min_samples),
             }
 
     holiday_segment_frame = residual_df[
@@ -1105,15 +1108,9 @@ def is_china_holiday(dt):
         # chinese_calendar.is_holiday includes regular weekends.
         # For business buckets we only treat statutory holidays as holiday.
         if hasattr(cn_calendar, 'get_holiday_detail'):
-            try:
-                is_holiday, holiday_label = cn_calendar.get_holiday_detail(dt)
-                return bool(is_holiday and holiday_label is not None)
-            except Exception:
-                pass
-        try:
-            if bool(cn_calendar.is_workday(dt)):
-                return False
-        except Exception:
+            is_holiday, holiday_label = cn_calendar.get_holiday_detail(dt)
+            return bool(is_holiday and holiday_label is not None)
+        if bool(cn_calendar.is_workday(dt)):
             return False
         return dt.weekday() < 5
     return False
@@ -1590,92 +1587,116 @@ def apply_holiday_zero_adjustment_to_backtest(bt_results, holiday_anchor):
     if not bool(holiday_anchor.get('enabled', False)):
         return bt_results
 
-    adjusted = dict(bt_results)
-    dates = pd.to_datetime(adjusted['dates'])
-    predicted = np.asarray(adjusted['predicted'], dtype=float).copy()
-    holiday_block_info = classify_holiday_blocks(dates)
+    def _adjust_window(window):
+        local = dict(window)
+        dates = pd.to_datetime(local['dates'])
+        predicted = np.asarray(local['predicted'], dtype=float).copy()
+        holiday_block_info = classify_holiday_blocks(dates)
 
-    base_strength = float(np.clip(holiday_anchor.get('strength', 0.0), 0.0, 1.0))
-    base_median = float(max(0.0, holiday_anchor.get('median', 0.0)))
-    proximity_anchors = holiday_anchor.get('proximity_anchors', {})
+        base_strength = float(np.clip(holiday_anchor.get('strength', 0.0), 0.0, 1.0))
+        base_median = float(max(0.0, holiday_anchor.get('median', 0.0)))
+        proximity_anchors = holiday_anchor.get('proximity_anchors', {})
 
-    for idx, dt in enumerate(dates):
-        if holiday_block_info['is_holiday_non_makeup'][idx] == 1:
-            use_long_holiday_anchor = bool(
-                holiday_anchor.get('long_holiday_enabled', False)
-                and holiday_block_info['block_length'][idx] >= 4
-                and 2 <= holiday_block_info['block_position'][idx] <= 5
-            )
-            if use_long_holiday_anchor:
-                strength = float(np.clip(holiday_anchor.get('long_holiday_strength', base_strength), 0.0, 1.0))
-                median = float(max(0.0, holiday_anchor.get('long_holiday_median', base_median)))
-            else:
-                strength = base_strength
-                median = base_median
+        for idx, _dt in enumerate(dates):
+            if holiday_block_info['is_holiday_non_makeup'][idx] == 1:
+                use_long_holiday_anchor = bool(
+                    holiday_anchor.get('long_holiday_enabled', False)
+                    and holiday_block_info['block_length'][idx] >= 4
+                    and 2 <= holiday_block_info['block_position'][idx] <= 5
+                )
+                if use_long_holiday_anchor:
+                    strength = float(np.clip(holiday_anchor.get('long_holiday_strength', base_strength), 0.0, 1.0))
+                    median = float(max(0.0, holiday_anchor.get('long_holiday_median', base_median)))
+                else:
+                    strength = base_strength
+                    median = base_median
 
-            predicted[idx] = max(0.0, min(predicted[idx], (1.0 - strength) * predicted[idx] + strength * median))
-        elif holiday_block_info['pre_holiday_n_day'][idx] == 1:
-            anchor_stats = proximity_anchors.get('pre_holiday_1d', {})
-            if bool(anchor_stats.get('enabled', False)):
-                strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
-                median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
-                predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
-        elif holiday_block_info['pre_holiday_n_day'][idx] == 2:
-            anchor_stats = proximity_anchors.get('pre_holiday_2d', {})
-            if bool(anchor_stats.get('enabled', False)):
-                strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
-                median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
-                predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
-        elif holiday_block_info['post_holiday_workday_n'][idx] == 1:
-            anchor_stats = proximity_anchors.get('post_holiday_workday_1', {})
-            if bool(anchor_stats.get('enabled', False)):
-                strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
-                median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
-                predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
-        elif holiday_block_info['post_holiday_workday_n'][idx] == 2:
-            anchor_stats = proximity_anchors.get('post_holiday_workday_2', {})
-            if bool(anchor_stats.get('enabled', False)):
-                strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
-                median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
-                predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
-        elif holiday_block_info['post_holiday_workday_n'][idx] == 3:
-            anchor_stats = proximity_anchors.get('post_holiday_workday_3', {})
-            if bool(anchor_stats.get('enabled', False)):
-                strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
-                median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
-                predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
-        else:
-            continue
+                predicted[idx] = max(0.0, min(predicted[idx], (1.0 - strength) * predicted[idx] + strength * median))
+            elif holiday_block_info['pre_holiday_n_day'][idx] == 1:
+                anchor_stats = proximity_anchors.get('pre_holiday_1d', {})
+                if bool(anchor_stats.get('enabled', False)):
+                    strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
+                    median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
+                    predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
+            elif holiday_block_info['pre_holiday_n_day'][idx] == 2:
+                anchor_stats = proximity_anchors.get('pre_holiday_2d', {})
+                if bool(anchor_stats.get('enabled', False)):
+                    strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
+                    median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
+                    predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
+            elif holiday_block_info['post_holiday_workday_n'][idx] == 1:
+                anchor_stats = proximity_anchors.get('post_holiday_workday_1', {})
+                if bool(anchor_stats.get('enabled', False)):
+                    strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
+                    median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
+                    predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
+            elif holiday_block_info['post_holiday_workday_n'][idx] == 2:
+                anchor_stats = proximity_anchors.get('post_holiday_workday_2', {})
+                if bool(anchor_stats.get('enabled', False)):
+                    strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
+                    median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
+                    predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
+            elif holiday_block_info['post_holiday_workday_n'][idx] == 3:
+                anchor_stats = proximity_anchors.get('post_holiday_workday_3', {})
+                if bool(anchor_stats.get('enabled', False)):
+                    strength = float(np.clip(anchor_stats.get('strength', 0.0), 0.0, 1.0))
+                    median = float(max(0.0, anchor_stats.get('median', predicted[idx])))
+                    predicted[idx] = max(0.0, (1.0 - strength) * predicted[idx] + strength * median)
 
-    adjusted['predicted'] = predicted
-    return adjusted
+        local['predicted'] = predicted
+        return local
+
+    windows = bt_results.get('all_windows', [])
+    if windows:
+        adjusted_windows = [_adjust_window(window) for window in windows]
+        adjusted = dict(bt_results)
+        adjusted['all_windows'] = adjusted_windows
+        adjusted['dates'] = adjusted_windows[0]['dates']
+        adjusted['actual'] = adjusted_windows[0]['actual']
+        adjusted['predicted'] = adjusted_windows[0]['predicted']
+        return adjusted
+
+    return _adjust_window(bt_results)
 
 
 def apply_spring_festival_service_adjustment_to_backtest(bt_results, spring_anchor):
     if not bool(spring_anchor.get('enabled', False)):
         return bt_results
 
-    adjusted = dict(bt_results)
-    dates = pd.to_datetime(adjusted['dates'])
-    predicted = np.asarray(adjusted['predicted'], dtype=float).copy()
-    phase = classify_spring_festival_service_phases(dates)
+    def _adjust_window(window):
+        local = dict(window)
+        dates = pd.to_datetime(local['dates'])
+        predicted = np.asarray(local['predicted'], dtype=float).copy()
+        phase = classify_spring_festival_service_phases(dates)
 
-    for idx in range(len(dates)):
-        pred_now = float(predicted[idx])
-        if phase['is_spring_shutdown'][idx] == 1 and bool(spring_anchor.get('shutdown_enabled', False)):
-            strength = float(np.clip(spring_anchor.get('shutdown_strength', 0.0), 0.0, 1.0))
-            median = float(max(0.0, spring_anchor.get('shutdown_median', 0.0)))
-            pred_new = max(0.0, (1.0 - strength) * pred_now + strength * median)
-        elif phase['is_spring_duty'][idx] == 1 and bool(spring_anchor.get('duty_enabled', False)):
-            strength = float(np.clip(spring_anchor.get('duty_strength', 0.0), 0.0, 1.0))
-            median = float(max(0.0, spring_anchor.get('duty_median', pred_now)))
-            pred_new = max(0.0, (1.0 - strength) * pred_now + strength * median)
-        else:
-            pred_new = pred_now
-        predicted[idx] = pred_new
+        for idx in range(len(dates)):
+            pred_now = float(predicted[idx])
+            if phase['is_spring_shutdown'][idx] == 1 and bool(spring_anchor.get('shutdown_enabled', False)):
+                strength = float(np.clip(spring_anchor.get('shutdown_strength', 0.0), 0.0, 1.0))
+                median = float(max(0.0, spring_anchor.get('shutdown_median', 0.0)))
+                pred_new = max(0.0, (1.0 - strength) * pred_now + strength * median)
+            elif phase['is_spring_duty'][idx] == 1 and bool(spring_anchor.get('duty_enabled', False)):
+                strength = float(np.clip(spring_anchor.get('duty_strength', 0.0), 0.0, 1.0))
+                median = float(max(0.0, spring_anchor.get('duty_median', pred_now)))
+                pred_new = max(0.0, (1.0 - strength) * pred_now + strength * median)
+            else:
+                pred_new = pred_now
+            predicted[idx] = pred_new
 
-    adjusted['predicted'] = predicted
-    return adjusted
+        local['predicted'] = predicted
+        return local
+
+    windows = bt_results.get('all_windows', [])
+    if windows:
+        adjusted_windows = [_adjust_window(window) for window in windows]
+        adjusted = dict(bt_results)
+        adjusted['all_windows'] = adjusted_windows
+        adjusted['dates'] = adjusted_windows[0]['dates']
+        adjusted['actual'] = adjusted_windows[0]['actual']
+        adjusted['predicted'] = adjusted_windows[0]['predicted']
+        return adjusted
+
+    return _adjust_window(bt_results)
 
 
 def predict_state_model_adjustment(dt, base_pred, residual_adjuster):
@@ -3296,7 +3317,13 @@ def evaluate_residual_adjustment_effect(bt_results, residual_adjuster, custom_we
     }
 
 
-def collect_adjusted_backtest_residuals(bt_results, residual_adjuster, leadwise_adjuster=None):
+def collect_adjusted_backtest_residuals(
+    bt_results,
+    residual_adjuster,
+    leadwise_adjuster=None,
+    holiday_anchor=None,
+    spring_anchor=None,
+):
     windows = bt_results.get('all_windows', [])
     if not windows:
         windows = [bt_results]
@@ -3323,6 +3350,18 @@ def collect_adjusted_backtest_residuals(bt_results, residual_adjuster, leadwise_
             adjusted_pred.append(max(0.0, float(pred) + adjustment))
 
         adjusted_pred = np.asarray(adjusted_pred, dtype=float)
+        if holiday_anchor is not None and bool(holiday_anchor.get('enabled', False)):
+            holiday_adjusted = apply_holiday_zero_adjustment_to_backtest(
+                {'dates': dates, 'actual': actual, 'predicted': adjusted_pred},
+                holiday_anchor,
+            )
+            adjusted_pred = np.asarray(holiday_adjusted['predicted'], dtype=float)
+        if spring_anchor is not None and bool(spring_anchor.get('enabled', False)):
+            spring_adjusted = apply_spring_festival_service_adjustment_to_backtest(
+                {'dates': dates, 'actual': actual, 'predicted': adjusted_pred},
+                spring_anchor,
+            )
+            adjusted_pred = np.asarray(spring_adjusted['predicted'], dtype=float)
         residuals.extend((actual - adjusted_pred).tolist())
 
     return np.asarray(residuals, dtype=float)
@@ -3384,6 +3423,8 @@ def evaluate_interval_calibration_backtest(
     residual_adjuster,
     coverage=0.80,
     leadwise_adjuster=None,
+    holiday_anchor=None,
+    spring_anchor=None,
     asymmetric=False,
     lower_coverage=None,
     upper_coverage=None,
@@ -3421,6 +3462,18 @@ def evaluate_interval_calibration_backtest(
                 adjustment += lead_weight * lead_bias
             adjusted_pred.append(max(0.0, float(pred) + adjustment))
         adjusted_pred = np.asarray(adjusted_pred, dtype=float)
+        if holiday_anchor is not None and bool(holiday_anchor.get('enabled', False)):
+            holiday_adjusted = apply_holiday_zero_adjustment_to_backtest(
+                {'dates': dates, 'actual': actual, 'predicted': adjusted_pred},
+                holiday_anchor,
+            )
+            adjusted_pred = np.asarray(holiday_adjusted['predicted'], dtype=float)
+        if spring_anchor is not None and bool(spring_anchor.get('enabled', False)):
+            spring_adjusted = apply_spring_festival_service_adjustment_to_backtest(
+                {'dates': dates, 'actual': actual, 'predicted': adjusted_pred},
+                spring_anchor,
+            )
+            adjusted_pred = np.asarray(spring_adjusted['predicted'], dtype=float)
         adjusted_windows.append({'actual': actual, 'pred': adjusted_pred})
 
     for idx, target_window in enumerate(adjusted_windows):
@@ -4390,9 +4443,20 @@ def main():
         lead_effect_call = None
         dynamic_call_cap_info = {'mode': 'disabled', 'recent_smape': None}
 
+    holiday_anchor_call = estimate_holiday_zero_anchor(df[['date', 'call_volume']].copy(), 'call_volume')
+    fut_call = apply_holiday_zero_adjustment(fut_call, holiday_anchor_call)
+    spring_anchor_call = estimate_spring_festival_service_anchor(df[['date', 'call_volume']].copy(), 'call_volume')
+    fut_call = apply_spring_festival_service_adjustment(fut_call, spring_anchor_call)
+
     if not args.disable_interval_calibration:
         call_interval_cfg = call_tuning.get('asymmetric_interval', {})
-        residuals_call = collect_adjusted_backtest_residuals(bt_call, residual_adjuster_call, leadwise_adjuster=leadwise_call)
+        residuals_call = collect_adjusted_backtest_residuals(
+            bt_call,
+            residual_adjuster_call,
+            leadwise_adjuster=leadwise_call,
+            holiday_anchor=holiday_anchor_call,
+            spring_anchor=spring_anchor_call,
+        )
         fut_call, calib_call = calibrate_prediction_intervals(
             fut_call,
             residuals_call,
@@ -4406,6 +4470,8 @@ def main():
             residual_adjuster_call,
             coverage=args.interval_coverage,
             leadwise_adjuster=leadwise_call,
+            holiday_anchor=holiday_anchor_call,
+            spring_anchor=spring_anchor_call,
             asymmetric=bool(call_interval_cfg.get('enabled', False)),
             lower_coverage=call_interval_cfg.get('lower_coverage', args.interval_coverage),
             upper_coverage=call_interval_cfg.get('upper_coverage', args.interval_coverage),
@@ -4421,10 +4487,6 @@ def main():
             'asymmetric': False,
         }
 
-    holiday_anchor_call = estimate_holiday_zero_anchor(df[['date', 'call_volume']].copy(), 'call_volume')
-    fut_call = apply_holiday_zero_adjustment(fut_call, holiday_anchor_call)
-    spring_anchor_call = estimate_spring_festival_service_anchor(df[['date', 'call_volume']].copy(), 'call_volume')
-    fut_call = apply_spring_festival_service_adjustment(fut_call, spring_anchor_call)
     call_bias_snapshot = build_bucket_bias_snapshot(
         bt_call,
         residual_adjuster_call,
@@ -4657,9 +4719,20 @@ def main():
         lead_effect_ticket = None
         dynamic_ticket_cap_info = {'mode': 'disabled', 'recent_smape': None}
 
+    holiday_anchor_ticket = estimate_holiday_zero_anchor(df[['date', 'tickets_received']].copy(), 'tickets_received')
+    fut_ticket = apply_holiday_zero_adjustment(fut_ticket, holiday_anchor_ticket)
+    spring_anchor_ticket = estimate_spring_festival_service_anchor(df[['date', 'tickets_received']].copy(), 'tickets_received')
+    fut_ticket = apply_spring_festival_service_adjustment(fut_ticket, spring_anchor_ticket)
+
     if not args.disable_interval_calibration:
         ticket_interval_cfg = ticket_tuning.get('asymmetric_interval', {})
-        residuals_ticket = collect_adjusted_backtest_residuals(bt_ticket, residual_adjuster, leadwise_adjuster=leadwise_ticket)
+        residuals_ticket = collect_adjusted_backtest_residuals(
+            bt_ticket,
+            residual_adjuster,
+            leadwise_adjuster=leadwise_ticket,
+            holiday_anchor=holiday_anchor_ticket,
+            spring_anchor=spring_anchor_ticket,
+        )
         fut_ticket, calib_ticket = calibrate_prediction_intervals(
             fut_ticket,
             residuals_ticket,
@@ -4673,6 +4746,8 @@ def main():
             residual_adjuster,
             coverage=args.interval_coverage,
             leadwise_adjuster=leadwise_ticket,
+            holiday_anchor=holiday_anchor_ticket,
+            spring_anchor=spring_anchor_ticket,
             asymmetric=bool(ticket_interval_cfg.get('enabled', False)),
             lower_coverage=ticket_interval_cfg.get('lower_coverage', args.interval_coverage),
             upper_coverage=ticket_interval_cfg.get('upper_coverage', args.interval_coverage),
@@ -4688,10 +4763,6 @@ def main():
             'asymmetric': False,
         }
 
-    holiday_anchor_ticket = estimate_holiday_zero_anchor(df[['date', 'tickets_received']].copy(), 'tickets_received')
-    fut_ticket = apply_holiday_zero_adjustment(fut_ticket, holiday_anchor_ticket)
-    spring_anchor_ticket = estimate_spring_festival_service_anchor(df[['date', 'tickets_received']].copy(), 'tickets_received')
-    fut_ticket = apply_spring_festival_service_adjustment(fut_ticket, spring_anchor_ticket)
     ticket_bias_snapshot = build_bucket_bias_snapshot(
         bt_ticket,
         residual_adjuster,

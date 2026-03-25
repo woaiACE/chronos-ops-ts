@@ -195,35 +195,36 @@ def build_supervised_features(df, target_col, reference_col=None, holiday_fn=Non
 
     target = df[target_col].astype(float)
 
+    # Shift history-based features forward by one day so row d can use observation d.
     for lag in range(1, 15):
-        features[f'{target_col}_lag_{lag}'] = target.shift(lag)
+        features[f'{target_col}_lag_{lag}'] = target.shift(max(lag - 1, 0))
 
     for window in [3, 7, 14, 30]:
-        features[f'{target_col}_roll_mean_{window}'] = target.shift(1).rolling(window).mean()
-        features[f'{target_col}_roll_std_{window}'] = target.shift(1).rolling(window).std()
+        features[f'{target_col}_roll_mean_{window}'] = target.rolling(window).mean()
+        features[f'{target_col}_roll_std_{window}'] = target.rolling(window).std()
 
-    features[f'{target_col}_diff_1'] = target.shift(1) - target.shift(2)
-    features[f'{target_col}_diff_7'] = target.shift(1) - target.shift(8)
+    features[f'{target_col}_diff_1'] = target - target.shift(1)
+    features[f'{target_col}_diff_7'] = target - target.shift(7)
 
     if reference_col and reference_col in df.columns:
         ref = df[reference_col].astype(float)
-        features[f'{reference_col}_lag_1'] = ref.shift(1)
-        features[f'{reference_col}_lag_7'] = ref.shift(7)
-        features[f'{reference_col}_lag_14'] = ref.shift(14)
+        features[f'{reference_col}_lag_1'] = ref
+        features[f'{reference_col}_lag_7'] = ref.shift(6)
+        features[f'{reference_col}_lag_14'] = ref.shift(13)
 
         for window in [3, 7, 14, 30]:
-            features[f'{reference_col}_roll_mean_{window}'] = ref.shift(1).rolling(window).mean()
-            features[f'{reference_col}_roll_std_{window}'] = ref.shift(1).rolling(window).std()
+            features[f'{reference_col}_roll_mean_{window}'] = ref.rolling(window).mean()
+            features[f'{reference_col}_roll_std_{window}'] = ref.rolling(window).std()
 
         ratio_raw = ref / np.clip(target, 1e-6, None)
-        features['call_to_ticket_ratio_lag1'] = ratio_raw.shift(1)
-        features['call_to_ticket_ratio_lag7'] = ratio_raw.shift(7)
+        features['call_to_ticket_ratio_lag1'] = ratio_raw
+        features['call_to_ticket_ratio_lag7'] = ratio_raw.shift(6)
 
     if target_col == 'tickets_received' and 'tickets_resolved' in df.columns:
         resolved = df['tickets_resolved'].astype(float)
         backlog = target - resolved
-        features['estimated_backlog_lag1'] = backlog.shift(1)
-        features['estimated_backlog_roll_mean_7'] = backlog.shift(1).rolling(7).mean()
+        features['estimated_backlog_lag1'] = backlog
+        features['estimated_backlog_roll_mean_7'] = backlog.rolling(7).mean()
 
     return features
 
