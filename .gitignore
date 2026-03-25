@@ -4,3 +4,10 @@ local_chronos2_model/
 __pycache__/
 .vscode/
 *.png
+
+# Generated artifacts and local run outputs
+outputs/
+*.log
+
+# Local scratch notebooks
+Untitled-1.ipynb

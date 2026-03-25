@@ -3,3 +3,5 @@ chronos-forecasting
 pandas
 matplotlib
 scikit-learn
+chinese-calendar
+PyYAML

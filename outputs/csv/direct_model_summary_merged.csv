@@ -1,0 +1,7 @@
+lead,model_name,val_smape,target_name
+1,ridge_large_sample,,call_volume
+2,ridge_large_sample,,call_volume
+3,ridge_large_sample,,call_volume
+1,ridge_large_sample,,tickets_received
+2,ridge_large_sample,,tickets_received
+3,ridge_large_sample,,tickets_received
